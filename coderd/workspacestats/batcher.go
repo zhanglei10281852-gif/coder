@@ -3,7 +3,10 @@ package workspacestats
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,17 +26,51 @@ import (
 const (
 	defaultBufferSize    = 1024
 	defaultFlushInterval = time.Second
+
+	// shutdownFlushTimeout bounds the best-effort drain of in-memory reports
+	// when the process stops. Batches that cannot make it to the database in
+	// that window are spooled for the next start.
+	shutdownFlushTimeout = 15 * time.Second
+	// minRetryBackoff/maxRetryBackoff pace retries of complete batches while
+	// the database is unavailable.
+	minRetryBackoff = 200 * time.Millisecond
+	maxRetryBackoff = 30 * time.Second
+
+	spoolSuffix = ".json"
+	tmpSuffix   = ".tmp"
+	badSuffix   = ".corrupt"
 )
 
 type Batcher interface {
 	Add(now time.Time, agentID uuid.UUID, templateID uuid.UUID, userID uuid.UUID, workspaceID uuid.UUID, st *agentproto.Stats, usage bool)
 }
 
+// pendingBatch is a fully prepared, self-contained insert. Its JSON fields are
+// already marshaled, so the batch can be retried, spooled to disk and recovered
+// without touching or blocking the active accumulation buffer.
+type pendingBatch struct {
+	params    database.InsertWorkspaceAgentStatsParams
+	spoolPath string
+	attempts  int
+}
+
 // DBBatcher holds a buffer of agent stats and periodically flushes them to
 // its configured store.
+//
+// Accepted reports are never lost to a database outage:
+//
+//   - Complete batches that fail to insert stay intact and are retried with
+//     backoff. New reports keep accumulating in a fresh buffer, so one failed
+//     batch never blocks later reports.
+//   - Failed batches are spooled to disk (when a spool directory is
+//     configured), and spooled batches are recovered on the next start.
+//   - Row IDs are generated on acceptance and carried through every replay,
+//     so inserting (and the template usage rollup that follows) stays
+//     idempotent thanks to ON CONFLICT DO NOTHING.
 type DBBatcher struct {
-	store database.Store
-	log   slog.Logger
+	store    database.Store
+	log      slog.Logger
+	spoolDir string
 
 	mu sync.Mutex
 	// TODO: make this a buffered chan instead?
@@ -42,6 +79,10 @@ type DBBatcher struct {
 	connectionsByProto []map[string]int64
 	sessionCounts      []map[string]int64
 	batchSize          int
+	// queue holds complete batches waiting to be (re)inserted, oldest first.
+	// Batches recovered from the spool directory and batches whose insert
+	// failed live here.
+	queue []*pendingBatch
 
 	// tickCh is used to periodically flush the buffer.
 	tickCh   <-chan time.Time
@@ -50,6 +91,13 @@ type DBBatcher struct {
 	// flushLever is used to signal the flusher to flush the buffer immediately.
 	flushLever  chan struct{}
 	flushForced atomic.Bool
+	// retryTimer fires when queued batches should be retried after a failure.
+	// It is nil while there is nothing to retry.
+	retryTimer *time.Timer
+	// retryMinBackoff/retryMaxBackoff default to the package constants and can
+	// be overridden in tests to keep flush timing deterministic.
+	retryMinBackoff time.Duration
+	retryMaxBackoff time.Duration
 	// flushed is used during testing to signal that a flush has completed.
 	flushed chan<- int
 
@@ -96,6 +144,17 @@ func BatcherWithRegisterer(reg prometheus.Registerer) BatcherOption {
 	}
 }
 
+// BatcherWithSpoolDir enables durable recovery. Batches that cannot be
+// inserted because the database is unavailable are written as complete files
+// into dir, and batches found there are replayed (idempotently) when the
+// batcher starts. An empty dir disables spooling: recovery is then limited to
+// the lifetime of the process.
+func BatcherWithSpoolDir(dir string) BatcherOption {
+	return func(b *DBBatcher) {
+		b.spoolDir = dir
+	}
+}
+
 // NewBatcher creates a new Batcher and starts it.
 func NewBatcher(ctx context.Context, opts ...BatcherOption) (*DBBatcher, func(), error) {
 	b := &DBBatcher{}
@@ -127,6 +186,22 @@ func NewBatcher(ctx context.Context, opts ...BatcherOption) (*DBBatcher, func(),
 
 	b.initBuf(b.batchSize)
 
+	if b.spoolDir != "" {
+		if err := os.MkdirAll(b.spoolDir, 0o700); err != nil {
+			return nil, nil, xerrors.Errorf("create agent stats spool directory: %w", err)
+		}
+		b.recoverSpool()
+	}
+
+	// Recovered batches belong to reports accepted before this process
+	// started, so replay them immediately rather than waiting for a tick.
+	if len(b.queue) > 0 {
+		select {
+		case b.flushLever <- struct{}{}:
+		default:
+		}
+	}
+
 	cancelCtx, cancelFunc := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
@@ -146,6 +221,8 @@ func NewBatcher(ctx context.Context, opts ...BatcherOption) (*DBBatcher, func(),
 }
 
 // Add adds a stat to the batcher for the given workspace and agent.
+// It never blocks on database I/O: reports keep landing in the active buffer
+// even while earlier batches are queued for retry.
 func (b *DBBatcher) Add(
 	now time.Time,
 	agentID uuid.UUID,
@@ -205,34 +282,47 @@ func (b *DBBatcher) Add(
 func (b *DBBatcher) run(ctx context.Context) {
 	// nolint:gocritic // This is only ever used for one thing - inserting agent stats.
 	authCtx := dbauthz.AsSystemRestricted(ctx)
+	// A nil retry channel blocks forever; it is replaced once a batch fails.
+	var retry <-chan time.Time
 	for {
 		select {
 		case <-b.tickCh:
-			b.flush(authCtx, false, "scheduled")
+			retry = b.flush(authCtx, "scheduled")
 		case <-b.flushLever:
 			// If the flush lever is depressed, flush the buffer immediately.
-			b.flush(authCtx, true, "reaching capacity")
+			retry = b.flush(authCtx, "reaching capacity")
+		case <-retry:
+			retry = b.flush(authCtx, "retry")
 		case <-ctx.Done():
 			b.log.Debug(ctx, "context done, flushing before exit")
 
 			// We must create a new context here as the parent context is done.
-			ctxTimeout, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel() //nolint:revive // We're returning, defer is fine.
+			ctxTimeout, cancel := context.WithTimeout(context.Background(), shutdownFlushTimeout)
 
 			// nolint:gocritic // This is only ever used for one thing - inserting agent stats.
-			b.flush(dbauthz.AsSystemRestricted(ctxTimeout), true, "exit")
+			b.drain(dbauthz.AsSystemRestricted(ctxTimeout))
+			cancel()
 			return
 		}
 	}
 }
 
-// flush flushes the batcher's buffer.
-func (b *DBBatcher) flush(ctx context.Context, forced bool, reason string) {
+// flush inserts every currently queued or buffered batch. Batches older than
+// the active buffer are inserted first. The returned channel fires when
+// failed batches should be retried; it is nil when all inserts succeeded.
+func (b *DBBatcher) flush(ctx context.Context, reason string) (nextRetry <-chan time.Time) {
+	start := time.Now()
 	b.mu.Lock()
 	b.flushForced.Store(true)
-	start := time.Now()
-	count := len(b.buf.ID)
+	batches := b.takeBatchesLocked()
+	b.mu.Unlock()
+
+	count := 0
+	for _, batch := range batches {
+		count += len(batch.params.ID)
+	}
 	defer func() {
+		b.mu.Lock()
 		b.flushForced.Store(false)
 		b.mu.Unlock()
 		if count > 0 {
@@ -240,29 +330,99 @@ func (b *DBBatcher) flush(ctx context.Context, forced bool, reason string) {
 			b.log.Debug(ctx, "flush complete",
 				slog.F("count", count),
 				slog.F("elapsed", elapsed),
-				slog.F("forced", forced),
 				slog.F("reason", reason),
 			)
 		}
 		// Notify that a flush has completed. This only happens in tests.
-		if b.flushed != nil {
-			select {
-			case <-ctx.Done():
-				close(b.flushed)
-			default:
-				b.flushed <- count
-			}
-		}
+		b.notifyFlush(ctx, count)
 	}()
 
-	if len(b.buf.ID) == 0 {
-		return
+	if len(batches) == 0 {
+		b.stopRetryTimer()
+		return nil
 	}
 
-	// marshal connections by proto
+	failed := b.insertBatches(ctx, batches)
+	if len(failed) == 0 {
+		b.stopRetryTimer()
+		return nil
+	}
+
+	// Keep the failed batches ahead of anything that accumulates later.
+	b.mu.Lock()
+	b.queue = append(failed, b.queue...)
+	attempts := 0
+	for _, batch := range failed {
+		if batch.attempts > attempts {
+			attempts = batch.attempts
+		}
+	}
+	b.mu.Unlock()
+
+	b.log.Error(ctx, "failed to insert workspace agent stats, batches retained for retry",
+		slog.F("failed_batches", len(failed)),
+		slog.F("rows", count),
+		slog.F("attempt", attempts),
+		slog.F("elapsed", time.Since(start)),
+	)
+	return b.resetRetryTimer(b.backoff(attempts))
+}
+
+// drain attempts to insert everything still in memory at shutdown. Batches
+// that cannot be inserted within the context are spooled for the next start,
+// so a database outage during stop does not drop accepted reports.
+func (b *DBBatcher) drain(ctx context.Context) {
+	b.mu.Lock()
+	b.flushForced.Store(true)
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		b.flushForced.Store(false)
+		b.mu.Unlock()
+	}()
+
+	for {
+		if err := ctx.Err(); err != nil {
+			b.spoolRemaining(ctx)
+			return
+		}
+		b.mu.Lock()
+		batches := b.takeBatchesLocked()
+		b.mu.Unlock()
+		if len(batches) == 0 {
+			return
+		}
+		if failed := b.insertBatches(ctx, batches); len(failed) > 0 {
+			b.mu.Lock()
+			b.queue = append(failed, b.queue...)
+			b.mu.Unlock()
+			// The database is unavailable and the shutdown window is finite:
+			// get every batch onto disk instead of retrying.
+			b.spoolRemaining(ctx)
+			return
+		}
+	}
+}
+
+// takeBatchesLocked detaches all insertable batches from the batcher: queued
+// (older) batches first, followed by the prepared active buffer. b MUST be
+// locked. The returned batches are owned by the caller.
+func (b *DBBatcher) takeBatchesLocked() []*pendingBatch {
+	batches := b.queue
+	b.queue = nil
+	if len(b.buf.ID) > 0 {
+		batches = append(batches, b.prepareBatchLocked())
+	}
+	return batches
+}
+
+// prepareBatchLocked marshals the active buffer into a standalone batch and
+// replaces the active buffer with a fresh one, so new reports can accumulate
+// while the batch is in flight. b MUST be locked.
+func (b *DBBatcher) prepareBatchLocked() *pendingBatch {
 	payload, err := json.Marshal(b.connectionsByProto)
 	if err != nil {
-		b.log.Error(ctx, "unable to marshal agent connections by proto, dropping data", slog.Error(err))
+		b.log.Error(context.Background(), "unable to marshal agent connections by proto, dropping data", slog.Error(err))
 		b.buf.ConnectionsByProto = json.RawMessage(`[]`)
 	} else {
 		b.buf.ConnectionsByProto = payload
@@ -270,25 +430,98 @@ func (b *DBBatcher) flush(ctx context.Context, forced bool, reason string) {
 
 	sessionCountsPayload, err := json.Marshal(b.sessionCounts)
 	if err != nil {
-		b.log.Error(ctx, "unable to marshal agent session counts, dropping data", slog.Error(err))
+		b.log.Error(context.Background(), "unable to marshal agent session counts, dropping data", slog.Error(err))
 		b.buf.SessionCounts = json.RawMessage(`[]`)
 	} else {
 		b.buf.SessionCounts = sessionCountsPayload
 	}
 
-	// nolint:gocritic // (#13146) Will be moved soon as part of refactor.
-	err = b.store.InsertWorkspaceAgentStats(ctx, *b.buf)
-	elapsed := time.Since(start)
-	if err != nil {
-		if database.IsQueryCanceledError(err) {
-			b.log.Debug(ctx, "query canceled, skipping insert of workspace agent stats", slog.F("elapsed", elapsed))
-			return
+	batch := &pendingBatch{params: *b.buf}
+	b.initBuf(b.batchSize)
+	return batch
+}
+
+// insertBatches inserts batches in order and returns the ones that did not
+// make it, oldest first. A failure never stops the loop, so one bad or
+// temporarily failing batch cannot hold up the rest. Every returned batch has
+// been spooled when spooling is enabled.
+func (b *DBBatcher) insertBatches(ctx context.Context, batches []*pendingBatch) []*pendingBatch {
+	var failed []*pendingBatch
+	for i, batch := range batches {
+		if err := ctx.Err(); err != nil {
+			// No time left to attempt the rest; the caller spools them.
+			failed = append(failed, batches[i:]...)
+			break
 		}
-		b.log.Error(ctx, "error inserting workspace agent stats", slog.Error(err), slog.F("elapsed", elapsed))
+		batch.attempts++
+		err := b.store.InsertWorkspaceAgentStats(ctx, batch.params)
+		if err == nil {
+			b.spoolRemove(batch)
+			continue
+		}
+		if database.IsQueryCanceledError(err) {
+			b.log.Debug(ctx, "query canceled inserting workspace agent stats, batch retained",
+				slog.F("rows", len(batch.params.ID)),
+			)
+		} else {
+			b.log.Error(ctx, "error inserting workspace agent stats, batch retained",
+				slog.Error(err),
+				slog.F("rows", len(batch.params.ID)),
+				slog.F("attempt", batch.attempts),
+			)
+		}
+		b.spoolPersist(ctx, batch)
+		failed = append(failed, batch)
+	}
+	return failed
+}
+
+func (b *DBBatcher) notifyFlush(ctx context.Context, count int) {
+	if b.flushed == nil {
 		return
 	}
+	select {
+	case <-ctx.Done():
+		close(b.flushed)
+	default:
+		b.flushed <- count
+	}
+}
 
-	b.resetBuf()
+func (b *DBBatcher) resetRetryTimer(d time.Duration) <-chan time.Time {
+	b.stopRetryTimer()
+	b.retryTimer = time.NewTimer(d)
+	return b.retryTimer.C
+}
+
+func (b *DBBatcher) stopRetryTimer() {
+	if b.retryTimer != nil {
+		b.retryTimer.Stop()
+		b.retryTimer = nil
+	}
+}
+
+func (b *DBBatcher) backoff(attempts int) time.Duration {
+	minD := minRetryBackoff
+	if b.retryMinBackoff > 0 {
+		minD = b.retryMinBackoff
+	}
+	maxD := maxRetryBackoff
+	if b.retryMaxBackoff > 0 {
+		maxD = b.retryMaxBackoff
+	}
+	if attempts < 1 {
+		attempts = 1
+	}
+	shift := attempts - 1
+	if shift > 8 {
+		shift = 8
+	}
+	d := minD << shift
+	if d <= 0 || d > maxD {
+		return maxD
+	}
+	return d
 }
 
 // initBuf resets the buffer. b MUST be locked.
@@ -315,22 +548,217 @@ func (b *DBBatcher) initBuf(size int) {
 	b.sessionCounts = make([]map[string]int64, 0, size)
 }
 
-func (b *DBBatcher) resetBuf() {
-	b.buf.ID = b.buf.ID[:0]
-	b.buf.CreatedAt = b.buf.CreatedAt[:0]
-	b.buf.UserID = b.buf.UserID[:0]
-	b.buf.WorkspaceID = b.buf.WorkspaceID[:0]
-	b.buf.TemplateID = b.buf.TemplateID[:0]
-	b.buf.AgentID = b.buf.AgentID[:0]
-	b.buf.ConnectionsByProto = json.RawMessage(`[]`)
-	b.buf.ConnectionCount = b.buf.ConnectionCount[:0]
-	b.buf.RxPackets = b.buf.RxPackets[:0]
-	b.buf.RxBytes = b.buf.RxBytes[:0]
-	b.buf.TxPackets = b.buf.TxPackets[:0]
-	b.buf.TxBytes = b.buf.TxBytes[:0]
-	b.buf.SessionCounts = json.RawMessage(`[]`)
-	b.buf.ConnectionMedianLatencyMS = b.buf.ConnectionMedianLatencyMS[:0]
-	b.buf.Usage = b.buf.Usage[:0]
-	b.connectionsByProto = b.connectionsByProto[:0]
-	b.sessionCounts = b.sessionCounts[:0]
+// recoverSpool loads batches previously persisted to the spool directory into
+// the retry queue, oldest first. Unreadable or malformed files are quarantined
+// instead of blocking startup or later reports.
+func (b *DBBatcher) recoverSpool() {
+	ctx := context.Background()
+	entries, err := os.ReadDir(b.spoolDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			b.log.Warn(ctx, "unable to read agent stats spool directory, spooled batches skipped",
+				slog.F("dir", b.spoolDir), slog.Error(err))
+		}
+		return
+	}
+
+	recoveredBatches := 0
+	recoveredRows := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		switch {
+		case strings.HasSuffix(name, tmpSuffix):
+			// Leftover from a process that died mid-write; the final file was
+			// never renamed into place.
+			if err := os.Remove(filepath.Join(b.spoolDir, name)); err != nil {
+				b.log.Warn(ctx, "unable to remove stale agent stats spool temp file",
+					slog.F("path", name), slog.Error(err))
+			}
+		case strings.HasSuffix(name, spoolSuffix):
+			batch, err := b.readSpoolFile(name)
+			if err != nil {
+				b.quarantineSpool(name, err)
+				continue
+			}
+			b.queue = append(b.queue, batch)
+			recoveredBatches++
+			recoveredRows += len(batch.params.ID)
+		default:
+			// Quarantined files (ending in badSuffix) and unrelated files are
+			// left untouched.
+		}
+	}
+	if recoveredBatches > 0 {
+		b.log.Info(ctx, "recovered spooled agent stats batches",
+			slog.F("batches", recoveredBatches),
+			slog.F("rows", recoveredRows),
+		)
+	}
+}
+
+func (b *DBBatcher) readSpoolFile(name string) (*pendingBatch, error) {
+	data, err := os.ReadFile(filepath.Join(b.spoolDir, name))
+	if err != nil {
+		return nil, xerrors.Errorf("read spooled agent stats batch: %w", err)
+	}
+	var params database.InsertWorkspaceAgentStatsParams
+	if err := json.Unmarshal(data, &params); err != nil {
+		return nil, xerrors.Errorf("decode spooled agent stats batch: %w", err)
+	}
+	if err := validateAgentStatsParams(&params); err != nil {
+		return nil, xerrors.Errorf("validate spooled agent stats batch: %w", err)
+	}
+	return &pendingBatch{params: params, spoolPath: filepath.Join(b.spoolDir, name)}, nil
+}
+
+// validateAgentStatsParams asserts the positional arrays survived spooling
+// intact: all columns must carry exactly one entry per row.
+func validateAgentStatsParams(p *database.InsertWorkspaceAgentStatsParams) error {
+	n := len(p.ID)
+	if n == 0 {
+		return xerrors.New("batch contains no rows")
+	}
+	checks := []struct {
+		name string
+		got  int
+	}{
+		{"created_at", len(p.CreatedAt)},
+		{"user_id", len(p.UserID)},
+		{"workspace_id", len(p.WorkspaceID)},
+		{"template_id", len(p.TemplateID)},
+		{"agent_id", len(p.AgentID)},
+		{"connection_count", len(p.ConnectionCount)},
+		{"rx_packets", len(p.RxPackets)},
+		{"rx_bytes", len(p.RxBytes)},
+		{"tx_packets", len(p.TxPackets)},
+		{"tx_bytes", len(p.TxBytes)},
+		{"connection_median_latency_ms", len(p.ConnectionMedianLatencyMS)},
+		{"usage", len(p.Usage)},
+	}
+	for _, check := range checks {
+		if check.got != n {
+			return xerrors.Errorf("column %s has %d entries, want %d", check.name, check.got, n)
+		}
+	}
+	var connections []json.RawMessage
+	if err := json.Unmarshal(p.ConnectionsByProto, &connections); err != nil {
+		return xerrors.Errorf("decode connections_by_proto: %w", err)
+	}
+	if len(connections) != n {
+		return xerrors.Errorf("column connections_by_proto has %d entries, want %d", len(connections), n)
+	}
+	var sessionCounts []json.RawMessage
+	if err := json.Unmarshal(p.SessionCounts, &sessionCounts); err != nil {
+		return xerrors.Errorf("decode session_counts: %w", err)
+	}
+	if len(sessionCounts) != n {
+		return xerrors.Errorf("column session_counts has %d entries, want %d", len(sessionCounts), n)
+	}
+	return nil
+}
+
+func (b *DBBatcher) quarantineSpool(name string, cause error) {
+	bad := filepath.Join(b.spoolDir, name+badSuffix)
+	if err := os.Rename(filepath.Join(b.spoolDir, name), bad); err != nil {
+		b.log.Error(context.Background(), "unable to quarantine corrupt agent stats spool batch",
+			slog.F("path", name), slog.Error(err))
+		return
+	}
+	b.log.Error(context.Background(), "quarantined corrupt agent stats spool batch; other batches and reports are unaffected",
+		slog.F("path", bad), slog.Error(cause))
+}
+
+// spoolPersist durably writes a batch that failed to insert. It is a no-op
+// when spooling is disabled or the batch is already on disk.
+func (b *DBBatcher) spoolPersist(ctx context.Context, batch *pendingBatch) {
+	if b.spoolDir == "" {
+		return
+	}
+	b.mu.Lock()
+	if batch.spoolPath != "" {
+		b.mu.Unlock()
+		return
+	}
+	dir := b.spoolDir
+	b.mu.Unlock()
+
+	data, err := json.Marshal(batch.params)
+	if err != nil {
+		b.log.Error(ctx, "unable to encode agent stats batch for spool, batch retained in memory only", slog.Error(err))
+		return
+	}
+	path, err := writeSpoolFile(dir, data)
+	if err != nil {
+		b.log.Error(ctx, "unable to spool agent stats batch, batch retained in memory only", slog.Error(err))
+		return
+	}
+	b.mu.Lock()
+	if batch.spoolPath == "" {
+		batch.spoolPath = path
+	} else {
+		// The batch was spooled concurrently; drop the duplicate file.
+		_ = os.Remove(path)
+	}
+	b.mu.Unlock()
+}
+
+// spoolRemaining writes every queued or buffered batch to disk without an
+// insert attempt. Used during shutdown when the database cannot be reached
+// before the drain deadline.
+func (b *DBBatcher) spoolRemaining(ctx context.Context) {
+	if b.spoolDir == "" {
+		b.log.Warn(ctx, "agent stats may be lost: database is unavailable and no spool directory is configured")
+		return
+	}
+	b.mu.Lock()
+	batches := b.queue
+	b.queue = nil
+	if len(b.buf.ID) > 0 {
+		batches = append(batches, b.prepareBatchLocked())
+	}
+	b.mu.Unlock()
+
+	for _, batch := range batches {
+		b.spoolPersist(ctx, batch)
+	}
+}
+
+func (b *DBBatcher) spoolRemove(batch *pendingBatch) {
+	b.mu.Lock()
+	path := batch.spoolPath
+	batch.spoolPath = ""
+	b.mu.Unlock()
+	if path == "" {
+		return
+	}
+	// A file that cannot be removed is replayed on the next start; ON CONFLICT
+	// keeps the replay from double-counting.
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		b.log.Warn(context.Background(), "failed to remove spooled agent stats batch; it will be replayed once",
+			slog.F("path", path), slog.Error(err))
+	}
+}
+
+// writeSpoolFile writes data atomically: a temp file in dir is renamed into
+// place, so recovery never sees a half-written batch. Filenames sort by the
+// time they were spooled, which is also the order batches are replayed.
+func writeSpoolFile(dir string, data []byte) (string, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", xerrors.Errorf("create spool directory: %w", err)
+	}
+	name := fmt.Sprintf("%019d-%s%s", time.Now().UnixNano(), uuid.NewString(), spoolSuffix)
+	tmpPath := filepath.Join(dir, "."+name+tmpSuffix)
+	finalPath := filepath.Join(dir, name)
+	//nolint:gosec // dir is operator configured and the file name is fully generated here.
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+		return "", xerrors.Errorf("write spool file: %w", err)
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", xerrors.Errorf("finalize spool file: %w", err)
+	}
+	return finalPath, nil
 }
