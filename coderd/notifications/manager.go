@@ -21,6 +21,17 @@ import (
 
 var ErrInvalidDispatchTimeout = xerrors.New("dispatch timeout must be less than lease period")
 
+// storeCallTimeout bounds each bulk update of dispatch results to the store.
+const storeCallTimeout = 30 * time.Second
+
+// shutdownFlushAttempts bounds how many times the manager attempts to persist buffered results
+// while shutting down. Results still unwritten after the final attempt remain recoverable: their
+// leases expire and the messages are re-acquired and re-dispatched.
+const shutdownFlushAttempts = 3
+
+// shutdownFlushBackoff is the wait between shutdown flush attempts.
+const shutdownFlushBackoff = 200 * time.Millisecond
+
 // Manager manages all notifications being enqueued and dispatched.
 //
 // Manager maintains a notifier: this consumes the queue of notification messages in the store.
@@ -28,12 +39,23 @@ var ErrInvalidDispatchTimeout = xerrors.New("dispatch timeout must be less than 
 // The notifier dequeues messages from the store _CODER_NOTIFICATIONS_LEASE_COUNT_ at a time and concurrently "dispatches"
 // these messages, meaning they are sent by their respective methods (email, webhook, etc).
 //
-// To reduce load on the store, successful and failed dispatches are accumulated in two separate buffers (success/failure)
-// of size CODER_NOTIFICATIONS_STORE_SYNC_INTERVAL in the Manager, and updates are sent to the store about which messages
-// succeeded or failed every CODER_NOTIFICATIONS_STORE_SYNC_INTERVAL seconds.
-// These buffers are limited in size, and naturally introduce some backpressure; if there are hundreds of messages to be
-// sent but they start failing too quickly, the buffers (receive channels) will fill up and block senders, which will
-// slow down the dispatch rate.
+// To reduce load on the store, successful and failed dispatches are first accumulated in two
+// separate buffered channels (success/failure) of size CODER_NOTIFICATIONS_STORE_SYNC_INTERVAL,
+// then drained into a pending backlog which is bulk-written to the store every
+// CODER_NOTIFICATIONS_STORE_SYNC_INTERVAL seconds. A result leaves the backlog only once its
+// store write is acknowledged: a failed bulk update retains its results and retries them on the
+// next flush, so a transient database error or a canceled context cannot drop an already produced
+// result. Graceful Stop() drains the backlog before returning; an ungraceful context cancellation
+// makes a bounded best-effort flush before exiting, and anything beyond that is recovered when
+// the message lease expires (at-least-once delivery).
+//
+// The bulk updates only apply while the producing notifier still owns the message lease, so stale
+// results left over from an expired lease cannot overwrite a sent, temporary_failure,
+// permanent_failure or inhibited state already confirmed by a later dispatch.
+//
+// These buffers naturally introduce some backpressure; if there are hundreds of messages to be
+// sent but they start failing too quickly, the buffers (receive channels) will fill up and block
+// senders, which will slow down the dispatch rate.
 //
 // NOTE: The above backpressure mechanism only works within the same process, which may not be true forever, such as if
 // we split notifiers out into separate targets for greater processing throughput; in this case we will need an
@@ -50,7 +72,20 @@ type Manager struct {
 
 	metrics *Metrics
 
+	// success/failure are ingestion channels written to by the notifier and drained by the store
+	// sync goroutine into the pending backlog.
 	success, failure chan dispatchResult
+
+	// resultsMu guards pendingSuccess/pendingFailure. The store sync goroutine is their sole
+	// mutator; BufferedUpdatesCount reads them concurrently.
+	resultsMu      sync.Mutex
+	pendingSuccess []dispatchResult
+	pendingFailure []dispatchResult
+
+	// flushMu ensures bulk updates do not overlap. A tick fired while a flush is still waiting
+	// on a slow store is skipped rather than piling duplicate bulk updates onto the store; the
+	// in-flight flush owns the retained backlog. Shutdown flushes take the lock blocking.
+	flushMu sync.Mutex
 
 	mu       sync.Mutex // Protects following.
 	closed   bool
@@ -180,46 +215,13 @@ func (m *Manager) loop(ctx context.Context) error {
 		return m.notifier.run(m.success, m.failure)
 	})
 
-	m.mu.Unlock()
-
-	// Periodically flush notification state changes to the store.
+	// Periodically flush notification state changes to the store, and perform the final flush
+	// when the manager stops.
 	eg.Go(func() error {
-		// Every interval, collect the messages in the channels and bulk update them in the store.
-		tick := m.clock.NewTicker(m.cfg.StoreSyncInterval.Value(), "Manager", "storeSync")
-		defer tick.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				// Nothing we can do in this scenario except bail out; after the message lease expires, the messages will
-				// be requeued and users will receive duplicates.
-				// This is an explicit trade-off between keeping the database load light (by bulk-updating records) and
-				// exactly-once delivery.
-				//
-				// The current assumption is that duplicate delivery of these messages is, at worst, slightly annoying.
-				// If these notifications are triggering external actions (e.g. via webhooks) this could be more
-				// consequential, and we may need a more sophisticated mechanism.
-				//
-				// TODO: mention the above tradeoff in documentation.
-				m.log.Warn(ctx, "exiting ungracefully", slog.Error(ctx.Err()))
-
-				if len(m.success)+len(m.failure) > 0 {
-					m.log.Warn(ctx, "content canceled with pending updates in buffer, these messages will be sent again after lease expires",
-						slog.F("success_count", len(m.success)), slog.F("failure_count", len(m.failure)))
-				}
-				return ctx.Err()
-			case <-m.stop:
-				if len(m.success)+len(m.failure) > 0 {
-					m.log.Warn(ctx, "flushing buffered updates before stop",
-						slog.F("success_count", len(m.success)), slog.F("failure_count", len(m.failure)))
-					m.syncUpdates(ctx)
-					m.log.Warn(ctx, "flushing updates done")
-				}
-				return nil
-			case <-tick.C:
-				m.syncUpdates(ctx)
-			}
-		}
+		return m.runStoreSync(ctx)
 	})
+
+	m.mu.Unlock()
 
 	err := eg.Wait()
 	if err != nil {
@@ -228,30 +230,133 @@ func (m *Manager) loop(ctx context.Context) error {
 	return err
 }
 
-// BufferedUpdatesCount returns the number of buffered updates which are currently waiting to be flushed to the store.
-// The returned values are for success & failure, respectively.
-func (m *Manager) BufferedUpdatesCount() (success int, failure int) {
-	return len(m.success), len(m.failure)
+// runStoreSync is the store synchronization loop. It periodically drains dispatch results into
+// bulk store updates and performs the converging final flush when the manager stops or its context
+// is canceled.
+func (m *Manager) runStoreSync(ctx context.Context) error {
+	// Every interval, collect the buffered messages and bulk update them in the store.
+	tick := m.clock.NewTicker(m.cfg.StoreSyncInterval.Value(), "Manager", "storeSync")
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			// Ungraceful shutdown (e.g. the process context was canceled). Make a bounded
+			// best-effort attempt to persist every result already produced, so dispatch outcomes
+			// do not silently vanish. The flush context is detached from the canceled context so
+			// the store calls keep their authorization and a bounded lifetime. Results that cannot
+			// be persisted stay recoverable: their leases expire and the messages are re-acquired
+			// and re-dispatched (at-least-once delivery).
+			m.log.Warn(ctx, "notification context canceled; attempting best-effort flush of buffered results",
+				slog.Error(ctx.Err()))
+			m.shutdown(context.WithoutCancel(ctx), false)
+			return ctx.Err()
+		case <-m.stop:
+			// Graceful Stop(): Stop() has already awaited the notifier, so all in-flight
+			// dispatches completed and every result that will exist is buffered. Drain and flush
+			// with a context that survives a manager context which was canceled concurrently.
+			m.shutdown(context.WithoutCancel(ctx), true)
+			return nil
+		case <-tick.C:
+			m.flushResults(ctx)
+		}
+	}
 }
 
-// syncUpdates updates messages in the store based on the given successful and failed message dispatch results.
-func (m *Manager) syncUpdates(ctx context.Context) {
-	// Ensure we update the metrics to reflect the current state after each invocation.
-	defer m.metrics.pendingUpdatesGauge.set(func() int { return len(m.success) + len(m.failure) })
+// shutdown awaits the dispatch producers and repeatedly flushes buffered results until they are
+// all persisted or the attempt budget is exhausted. flushCtx is detached from the (possibly
+// canceled) manager context by the caller, so store calls retain authorization but not
+// cancellation.
+func (m *Manager) shutdown(flushCtx context.Context, graceful bool) {
+	// Move anything already buffered into the backlog first, freeing channel capacity for any
+	// producer still blocked depositing a result under backpressure.
+	m.drainPending()
 
-	select {
-	case <-ctx.Done():
-		return
-	default:
+	// Await the notifier so no result is produced after the final drain. On a graceful Stop() it
+	// has already exited; on context cancellation the in-flight dispatch contexts are themselves
+	// canceled, so this is bounded by the configured dispatch timeout. stop is idempotent, so a
+	// race with an explicit Stop() is harmless.
+	if m.notifier != nil {
+		m.notifier.stop()
 	}
 
-	nSuccess := len(m.success)
-	nFailure := len(m.failure)
+	for attempt := 1; ; attempt++ {
+		m.drainPending()
+		if m.pendingTotal() == 0 {
+			return
+		}
 
-	m.metrics.pendingUpdatesGauge.set(func() int { return len(m.success) + len(m.failure) })
+		// Block behind any in-flight tick flush so the backlog is neither flushed twice nor
+		// observed as pending while it is being cleared.
+		m.flushMu.Lock()
+		m.flushResultsLocked(flushCtx)
+		m.flushMu.Unlock()
 
-	// Nothing to do.
-	if nSuccess+nFailure == 0 {
+		m.drainPending()
+		if m.pendingTotal() == 0 {
+			return
+		}
+		if attempt >= shutdownFlushAttempts {
+			break
+		}
+
+		m.log.Warn(flushCtx, "retrying flush of buffered notification results before shutdown",
+			slog.F("attempt", attempt), slog.F("pending", m.pendingTotal()))
+		timer := m.clock.NewTimer(shutdownFlushBackoff)
+		<-timer.C
+		timer.Stop()
+	}
+
+	success, failure := m.pendingCounts()
+	m.log.Error(flushCtx, "giving up flushing buffered notification results during shutdown; "+
+		"their leases will expire and the messages will be re-dispatched",
+		slog.F("graceful", graceful),
+		slog.F("success_count", success), slog.F("failure_count", failure))
+}
+
+// BufferedUpdatesCount returns the number of buffered updates which are currently waiting to be flushed to the store.
+// The returned values are for success & failure, respectively. This includes results drained into the pending backlog
+// that are awaiting a retry after a failed store update.
+func (m *Manager) BufferedUpdatesCount() (success int, failure int) {
+	m.resultsMu.Lock()
+	defer m.resultsMu.Unlock()
+	return len(m.success) + len(m.pendingSuccess), len(m.failure) + len(m.pendingFailure)
+}
+
+// flushResults drains newly produced dispatch results into the pending backlog and bulk-updates
+// the store for all pending results. Ticks skipped while another flush is still in progress simply
+// leave the backlog (and the ingestion channels) to the in-flight flush.
+func (m *Manager) flushResults(ctx context.Context) {
+	// A slow store can keep a flush running across several sync intervals. Skip those ticks
+	// instead of queuing duplicate bulk updates, which would contend for the store and could
+	// double-increment attempt counters if an ambiguous update eventually lands.
+	if !m.flushMu.TryLock() {
+		return
+	}
+	defer m.flushMu.Unlock()
+	m.flushResultsLocked(ctx)
+}
+
+// flushResultsLocked bulk-updates the store for all pending results. The caller must hold
+// flushMu.
+//
+// A result leaves the backlog only after the store acknowledges its write. When a bulk update
+// fails (store unavailable, timeout, canceled context) the whole batch is retained and retried on
+// the next flush. The success and failure batches are written independently, so a failure to
+// persist one never blocks the other, and a single handler's results cannot block other
+// handlers' results.
+//
+// The store only applies a result while the message is still leased by the notifier that
+// produced it. Results whose lease expired and which were re-acquired by a (possibly different)
+// notifier match no row once the statement succeeds: they are stale and are dropped. They can
+// never overwrite a confirmed sent/temporary_failure/permanent_failure/inhibited state, and
+// retrying an ambiguously timed-out update is safe (the retry is a no-op on already finalized
+// rows, so attempt_count is not incremented twice).
+func (m *Manager) flushResultsLocked(ctx context.Context) {
+	m.drainPending()
+	m.refreshPendingGauge()
+	defer m.refreshPendingGauge()
+
+	if m.pendingTotal() == 0 {
 		return
 	}
 
@@ -260,21 +365,15 @@ func (m *Manager) syncUpdates(ctx context.Context) {
 		failureParams database.BulkMarkNotificationMessagesFailedParams
 	)
 
-	// Read all the existing messages due for update from the channel, but don't range over the channels because they
-	// block until they are closed.
-	//
-	// This is vulnerable to TOCTOU, but it's fine.
-	// If more items are added to the success or failure channels between measuring their lengths and now, those items
-	// will be processed on the next bulk update.
-
-	for i := 0; i < nSuccess; i++ {
-		res := <-m.success
+	// Snapshot the backlog into query params; the pending slices remain the source of truth until
+	// the store acknowledges the write.
+	m.resultsMu.Lock()
+	for _, res := range m.pendingSuccess {
 		successParams.IDs = append(successParams.IDs, res.msg)
 		successParams.SentAts = append(successParams.SentAts, res.ts)
+		successParams.NotifierIDs = append(successParams.NotifierIDs, res.notifier)
 	}
-	for i := 0; i < nFailure; i++ {
-		res := <-m.failure
-
+	for _, res := range m.pendingFailure {
 		var (
 			reason string
 			status database.NotificationMessageStatus
@@ -289,18 +388,32 @@ func (m *Manager) syncUpdates(ctx context.Context) {
 		default:
 			status = database.NotificationMessageStatusPermanentFailure
 		}
-
-		failureParams.IDs = append(failureParams.IDs, res.msg)
-		failureParams.FailedAts = append(failureParams.FailedAts, res.ts)
-		failureParams.Statuses = append(failureParams.Statuses, status)
 		if res.err != nil {
 			reason = res.err.Error()
 		}
+
+		failureParams.IDs = append(failureParams.IDs, res.msg)
+		failureParams.FailedAts = append(failureParams.FailedAts, res.ts)
+		failureParams.NotifierIDs = append(failureParams.NotifierIDs, res.notifier)
+		failureParams.Statuses = append(failureParams.Statuses, status)
 		failureParams.StatusReasons = append(failureParams.StatusReasons, reason)
 	}
+	m.resultsMu.Unlock()
 
-	// Execute bulk updates for success/failure concurrently.
-	var wg sync.WaitGroup
+	// #nosec G115 - Safe conversion for max send attempts and retry interval, which are expected to be within int32 range.
+	failureParams.MaxAttempts = int32(m.cfg.MaxSendAttempts)
+	// #nosec G115 - Safe conversion for retry interval which is expected to be within int32 range.
+	failureParams.RetryInterval = int32(m.cfg.RetryInterval.Value().Seconds())
+
+	var (
+		wg sync.WaitGroup
+
+		sentOK bool
+		sentN  int64
+
+		failedOK bool
+		failedN  int64
+	)
 	wg.Add(2)
 
 	go func() {
@@ -311,18 +424,19 @@ func (m *Manager) syncUpdates(ctx context.Context) {
 
 		logger := m.log.With(slog.F("type", "update_sent"))
 
-		// Give up after waiting for the store for 30s.
-		uctx, cancel := context.WithTimeout(ctx, time.Second*30)
+		// Bound how long we wait for the store.
+		uctx, cancel := context.WithTimeout(ctx, storeCallTimeout)
 		defer cancel()
 
 		n, err := m.store.BulkMarkNotificationMessagesSent(uctx, successParams)
 		if err != nil {
-			logger.Error(ctx, "bulk update failed", slog.Error(err))
+			logger.Error(ctx, "bulk update failed; results retained for a retry",
+				slog.F("retained", len(successParams.IDs)), slog.Error(err))
 			return
 		}
-		m.metrics.SyncedUpdates.Add(float64(n))
-
-		logger.Debug(ctx, "bulk update completed", slog.F("updated", n))
+		sentOK, sentN = true, n
+		logger.Debug(ctx, "bulk update completed",
+			slog.F("updated", n), slog.F("submitted", len(successParams.IDs)))
 	}()
 
 	go func() {
@@ -333,24 +447,102 @@ func (m *Manager) syncUpdates(ctx context.Context) {
 
 		logger := m.log.With(slog.F("type", "update_failed"))
 
-		// Give up after waiting for the store for 30s.
-		uctx, cancel := context.WithTimeout(ctx, time.Second*30)
+		// Bound how long we wait for the store.
+		uctx, cancel := context.WithTimeout(ctx, storeCallTimeout)
 		defer cancel()
 
-		// #nosec G115 - Safe conversion for max send attempts which is expected to be within int32 range
-		failureParams.MaxAttempts = int32(m.cfg.MaxSendAttempts)
-		failureParams.RetryInterval = int32(m.cfg.RetryInterval.Value().Seconds())
 		n, err := m.store.BulkMarkNotificationMessagesFailed(uctx, failureParams)
 		if err != nil {
-			logger.Error(ctx, "bulk update failed", slog.Error(err))
+			logger.Error(ctx, "bulk update failed; results retained for a retry",
+				slog.F("retained", len(failureParams.IDs)), slog.Error(err))
 			return
 		}
-		m.metrics.SyncedUpdates.Add(float64(n))
-
-		logger.Debug(ctx, "bulk update completed", slog.F("updated", n))
+		failedOK, failedN = true, n
+		logger.Debug(ctx, "bulk update completed",
+			slog.F("updated", n), slog.F("submitted", len(failureParams.IDs)))
 	}()
 
 	wg.Wait()
+
+	// Commit the outcome to the backlog. On error the results stay retained for a retry; on
+	// success every submitted result is accounted for, either updated or stale (its lease moved
+	// on), in which case dropping it is correct.
+	m.resultsMu.Lock()
+	defer m.resultsMu.Unlock()
+
+	if sentOK {
+		submitted := len(m.pendingSuccess)
+		if stale := int64(submitted) - sentN; stale > 0 {
+			m.log.Warn(ctx, "discarding stale sent results for messages re-acquired after lease expiry",
+				slog.F("updated", sentN), slog.F("stale", stale))
+		}
+		m.metrics.SyncedUpdates.Add(float64(sentN))
+		m.pendingSuccess = nil
+	}
+	if failedOK {
+		submitted := len(m.pendingFailure)
+		if stale := int64(submitted) - failedN; stale > 0 {
+			m.log.Warn(ctx, "discarding stale failed results for messages re-acquired after lease expiry",
+				slog.F("updated", failedN), slog.F("stale", stale))
+		}
+		m.metrics.SyncedUpdates.Add(float64(failedN))
+		m.pendingFailure = nil
+	}
+}
+
+// drainPending moves results currently buffered in the ingestion channels into the pending
+// backlog. It never blocks and drains at most the number of results buffered when it starts
+// (snapshot semantics): this preserves the channels' backpressure, as blocked senders filling
+// freed capacity are only processed on the next drain. Results produced after the snapshot are
+// picked up then, or by the final shutdown drain once producers have exited.
+func (m *Manager) drainPending() {
+	m.resultsMu.Lock()
+	defer m.resultsMu.Unlock()
+
+	drain := func(ch <-chan dispatchResult, pending *[]dispatchResult) {
+		// Snapshot the length before reading; ranging until the channel is empty would race with
+		// blocked senders parked on the channel and sweep far more results than the buffer held,
+		// defeating the backpressure the buffer provides.
+		for range len(ch) {
+			res := <-ch
+			*pending = appendDispatchResult(*pending, res)
+		}
+	}
+	drain(m.success, &m.pendingSuccess)
+	drain(m.failure, &m.pendingFailure)
+}
+
+// appendDispatchResult appends a result to the backlog, replacing any unflushed result for the
+// same message. If a lease expired and the same notifier re-acquired the message before a
+// previous result reached the store, the newest result is the authoritative outcome of the
+// current lease.
+func appendDispatchResult(results []dispatchResult, res dispatchResult) []dispatchResult {
+	for i := range results {
+		if results[i].msg == res.msg {
+			results[i] = res
+			return results
+		}
+	}
+	return append(results, res)
+}
+
+func (m *Manager) pendingCounts() (success int, failure int) {
+	m.resultsMu.Lock()
+	defer m.resultsMu.Unlock()
+	return len(m.pendingSuccess), len(m.pendingFailure)
+}
+
+func (m *Manager) pendingTotal() int {
+	success, failure := m.pendingCounts()
+	return success + failure
+}
+
+// refreshPendingGauge reflects results waiting in both the ingestion channels and the retained
+// backlog (drained results that are awaiting a retry after a failed store update).
+func (m *Manager) refreshPendingGauge() {
+	m.metrics.pendingUpdatesGauge.set(func() int {
+		return len(m.success) + len(m.failure) + m.pendingTotal()
+	})
 }
 
 // Stop stops the notifier and waits until it has stopped.
