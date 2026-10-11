@@ -111,8 +111,15 @@ SET queued_seconds   = 0,
 FROM (SELECT UNNEST(@ids::uuid[])                             AS id,
              UNNEST(@failed_ats::timestamptz[])               AS failed_at,
              UNNEST(@statuses::notification_message_status[]) AS status,
-             UNNEST(@status_reasons::text[])                  AS status_reason) AS subquery
-WHERE notification_messages.id = subquery.id;
+             UNNEST(@status_reasons::text[])                  AS status_reason,
+             UNNEST(@notifier_ids::uuid[])                    AS notifier_id) AS subquery
+WHERE notification_messages.id = subquery.id
+  -- A buffered result is only valid while its notifier still owns the lease. If the lease
+  -- expired and the message was re-acquired (possibly by another notifier), the stale result
+  -- must not overwrite a state confirmed by the later dispatch. The notifier identity is
+  -- recorded by AcquireNotificationMessages in status_reason.
+  AND notification_messages.status = 'leased'::notification_message_status
+  AND notification_messages.status_reason = 'Leased by notifier ' || subquery.notifier_id::text;
 
 -- name: BulkMarkNotificationMessagesSent :execrows
 UPDATE notification_messages
@@ -124,9 +131,14 @@ SET queued_seconds   = 0,
     leased_until     = NULL,
     next_retry_after = NULL
 FROM (SELECT UNNEST(@ids::uuid[])             AS id,
-             UNNEST(@sent_ats::timestamptz[]) AS sent_at)
+             UNNEST(@sent_ats::timestamptz[]) AS sent_at,
+             UNNEST(@notifier_ids::uuid[])    AS notifier_id)
          AS new_values
-WHERE notification_messages.id = new_values.id;
+WHERE notification_messages.id = new_values.id
+  -- See BulkMarkNotificationMessagesFailed: stale results from a previous lease are dropped
+  -- instead of overwriting a state already confirmed by a re-acquired dispatch.
+  AND notification_messages.status = 'leased'::notification_message_status
+  AND notification_messages.status_reason = 'Leased by notifier ' || new_values.notifier_id::text;
 
 -- Delete all notification messages which have not been updated for over a week.
 -- name: DeleteOldNotificationMessages :exec
