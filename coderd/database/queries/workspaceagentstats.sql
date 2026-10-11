@@ -1,4 +1,6 @@
 -- name: InsertWorkspaceAgentStats :exec
+-- Row IDs are generated when the report is accepted and stay stable across
+-- retries and spool recovery, so ON CONFLICT makes replaying a batch idempotent.
 INSERT INTO
 	workspace_agent_stats (
 		id,
@@ -32,7 +34,8 @@ SELECT
 	unnest(@tx_bytes :: bigint[]) AS tx_bytes,
 	jsonb_array_elements(@session_counts :: jsonb) AS session_counts,
 	unnest(@connection_median_latency_ms :: double precision[]) AS connection_median_latency_ms,
-	unnest(@usage :: boolean[]) AS usage;
+	unnest(@usage :: boolean[]) AS usage
+ON CONFLICT (id) DO NOTHING;
 
 -- name: DeleteOldWorkspaceAgentStats :exec
 DELETE FROM
