@@ -21704,8 +21704,15 @@ SET queued_seconds   = 0,
 FROM (SELECT UNNEST($3::uuid[])                             AS id,
              UNNEST($4::timestamptz[])               AS failed_at,
              UNNEST($5::notification_message_status[]) AS status,
-             UNNEST($6::text[])                  AS status_reason) AS subquery
+             UNNEST($6::text[])                  AS status_reason,
+             UNNEST($7::uuid[])                    AS notifier_id) AS subquery
 WHERE notification_messages.id = subquery.id
+  -- A buffered result is only valid while its notifier still owns the lease. If the lease
+  -- expired and the message was re-acquired (possibly by another notifier), the stale result
+  -- must not overwrite a state confirmed by the later dispatch. The notifier identity is
+  -- recorded by AcquireNotificationMessages in status_reason.
+  AND notification_messages.status = 'leased'::notification_message_status
+  AND notification_messages.status_reason = 'Leased by notifier ' || subquery.notifier_id::text
 `
 
 type BulkMarkNotificationMessagesFailedParams struct {
@@ -21715,6 +21722,7 @@ type BulkMarkNotificationMessagesFailedParams struct {
 	FailedAts     []time.Time                 `db:"failed_ats" json:"failed_ats"`
 	Statuses      []NotificationMessageStatus `db:"statuses" json:"statuses"`
 	StatusReasons []string                    `db:"status_reasons" json:"status_reasons"`
+	NotifierIDs   []uuid.UUID                 `db:"notifier_ids" json:"notifier_ids"`
 }
 
 func (q *sqlQuerier) BulkMarkNotificationMessagesFailed(ctx context.Context, arg BulkMarkNotificationMessagesFailedParams) (int64, error) {
@@ -21725,6 +21733,7 @@ func (q *sqlQuerier) BulkMarkNotificationMessagesFailed(ctx context.Context, arg
 		pq.Array(arg.FailedAts),
 		pq.Array(arg.Statuses),
 		pq.Array(arg.StatusReasons),
+		pq.Array(arg.NotifierIDs),
 	)
 	if err != nil {
 		return 0, err
@@ -21742,18 +21751,28 @@ SET queued_seconds   = 0,
     leased_until     = NULL,
     next_retry_after = NULL
 FROM (SELECT UNNEST($1::uuid[])             AS id,
-             UNNEST($2::timestamptz[]) AS sent_at)
+             UNNEST($2::timestamptz[]) AS sent_at,
+             UNNEST($3::uuid[])        AS notifier_id)
          AS new_values
 WHERE notification_messages.id = new_values.id
+  -- See BulkMarkNotificationMessagesFailed: stale results from a previous lease are dropped
+  -- instead of overwriting a state already confirmed by a re-acquired dispatch.
+  AND notification_messages.status = 'leased'::notification_message_status
+  AND notification_messages.status_reason = 'Leased by notifier ' || new_values.notifier_id::text
 `
 
 type BulkMarkNotificationMessagesSentParams struct {
-	IDs     []uuid.UUID `db:"ids" json:"ids"`
-	SentAts []time.Time `db:"sent_ats" json:"sent_ats"`
+	IDs         []uuid.UUID `db:"ids" json:"ids"`
+	SentAts     []time.Time `db:"sent_ats" json:"sent_ats"`
+	NotifierIDs []uuid.UUID `db:"notifier_ids" json:"notifier_ids"`
 }
 
 func (q *sqlQuerier) BulkMarkNotificationMessagesSent(ctx context.Context, arg BulkMarkNotificationMessagesSentParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, bulkMarkNotificationMessagesSent, pq.Array(arg.IDs), pq.Array(arg.SentAts))
+	result, err := q.db.ExecContext(ctx, bulkMarkNotificationMessagesSent,
+		pq.Array(arg.IDs),
+		pq.Array(arg.SentAts),
+		pq.Array(arg.NotifierIDs),
+	)
 	if err != nil {
 		return 0, err
 	}
