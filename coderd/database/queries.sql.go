@@ -38623,6 +38623,7 @@ SELECT
 	jsonb_array_elements($13 :: jsonb) AS session_counts,
 	unnest($14 :: double precision[]) AS connection_median_latency_ms,
 	unnest($15 :: boolean[]) AS usage
+ON CONFLICT (id) DO NOTHING
 `
 
 type InsertWorkspaceAgentStatsParams struct {
