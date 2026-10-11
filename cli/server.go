@@ -1117,6 +1117,9 @@ func (r *RootCmd) Server(newAPI func(context.Context, *coderd.Options) (*coderd.
 				workspacestats.BatcherWithLogger(options.Logger.Named("batchstats")),
 				workspacestats.BatcherWithStore(options.Database),
 				workspacestats.BatcherWithRegisterer(options.PrometheusRegistry),
+				// Spool accepted stats that cannot be written during a database
+				// outage so they are recovered, exactly once, after a restart.
+				workspacestats.BatcherWithSpoolDir(filepath.Join(cacheDir, "agentstats-spool")),
 			)
 			if err != nil {
 				return xerrors.Errorf("failed to create agent stats batcher: %w", err)
